@@ -1,15 +1,9 @@
 let ctx: AudioContext | null = null;
-let musicStop: (() => void) | null = null;
-let musicKind: "title" | "story" | "battle" | "off" | null = null;
 
 function ac() {
   if (typeof window === "undefined") return null;
   if (!ctx) ctx = new AudioContext();
-  if (ctx.state === "suspended") {
-    void ctx.resume().then(() => {
-      if (musicKind && musicKind !== "off" && !musicStop) startLoop(musicKind);
-    });
-  }
+  if (ctx.state === "suspended") void ctx.resume();
   return ctx;
 }
 
@@ -52,6 +46,7 @@ function ping(c: AudioContext, freq: number, dur: number, gain: number, type: Os
 export type SfxKind = "click" | "move" | "hit" | "hurt" | "clash" | "crit" | "heal" | "win" | "lose";
 
 export function sfx(kind: SfxKind) {
+  unlockAudio();
   const c = ac();
   if (!c) return;
   if (kind === "clash") {
@@ -86,52 +81,164 @@ export function sfx(kind: SfxKind) {
   o.stop(now + 0.4);
 }
 
-const LOOPS: Record<"title" | "story" | "battle", number[]> = {
-  title: [262, 330, 392, 330, 294, 349, 440, 349],
-  story: [196, 247, 294, 330, 294, 247, 220, 196],
-  battle: [147, 175, 220, 196, 175, 220, 262, 220],
-};
+/** Track ids match `public/game/bgm/<id>.m4a`. */
+export type BgmTrack =
+  | "op"
+  | "happy"
+  | "event"
+  | "tragic"
+  | "march"
+  | "battle"
+  | "battle-fierce"
+  | "battle-tense"
+  | "battle-grand"
+  | "battle-cautious"
+  | "battle-march"
+  | "battle-tragic"
+  | "off";
 
-function startLoop(kind: "title" | "story" | "battle") {
-  const c = ac();
-  if (!c) return;
-  const notes = LOOPS[kind];
-  const master = c.createGain();
-  master.gain.value = kind === "battle" ? 0.03 : 0.045;
-  master.connect(c.destination);
-  let step = 0;
-  let stopped = false;
-  const tick = () => {
-    if (stopped || !ctx) return;
-    const now = ctx.currentTime;
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.type = kind === "battle" ? "triangle" : "sine";
-    o.frequency.setValueAtTime(notes[step % notes.length] ?? 220, now);
-    g.gain.setValueAtTime(0.0001, now);
-    g.gain.exponentialRampToValueAtTime(0.9, now + 0.03);
-    g.gain.exponentialRampToValueAtTime(0.0001, now + (kind === "story" ? 0.7 : 0.42));
-    o.connect(g);
-    g.connect(master);
-    o.start(now);
-    o.stop(now + 0.8);
-    if (kind === "battle" && step % 2 === 0) noise(ctx, 0.05, 180, 0.6, 0.04, "lowpass");
-    step += 1;
-  };
-  tick();
-  const id = window.setInterval(tick, kind === "story" ? 720 : 460);
-  musicStop = () => {
-    stopped = true;
-    window.clearInterval(id);
-    master.disconnect();
-  };
+const BGM_VOL = 0.55;
+const FADE_MS = 450;
+
+let unlocked = false;
+let hooksInstalled = false;
+/** Last requested track (same-track calls are no-ops). */
+let desiredTrack: BgmTrack | null = null;
+/** Track actually loaded into the current element. */
+let playingTrack: BgmTrack | null = null;
+let audioEl: HTMLAudioElement | null = null;
+let fadeTimer: ReturnType<typeof setInterval> | null = null;
+let gen = 0;
+
+function clearFade() {
+  if (fadeTimer != null) {
+    clearInterval(fadeTimer);
+    fadeTimer = null;
+  }
 }
 
-export function playBgm(kind: "title" | "story" | "battle" | "off") {
-  if (musicKind === kind) return;
-  musicStop?.();
-  musicStop = null;
-  musicKind = kind;
-  if (kind === "off") return;
-  startLoop(kind);
+function srcFor(track: Exclude<BgmTrack, "off">) {
+  return `/game/bgm/${track}.m4a`;
+}
+
+function stopEl(el: HTMLAudioElement) {
+  el.pause();
+  el.removeAttribute("src");
+  el.load();
+}
+
+function fadeOutThen(myGen: number, done: () => void) {
+  clearFade();
+  const el = audioEl;
+  if (!el) {
+    done();
+    return;
+  }
+  const startVol = el.volume;
+  const steps = 8;
+  let i = 0;
+  fadeTimer = setInterval(() => {
+    if (myGen !== gen) {
+      clearFade();
+      return;
+    }
+    i += 1;
+    el.volume = Math.max(0, startVol * (1 - i / steps));
+    if (i >= steps) {
+      clearFade();
+      stopEl(el);
+      if (audioEl === el) audioEl = null;
+      playingTrack = null;
+      done();
+    }
+  }, FADE_MS / steps);
+}
+
+function startTrack(track: Exclude<BgmTrack, "off">, myGen: number) {
+  if (myGen !== gen || desiredTrack !== track) return;
+  clearFade();
+  if (audioEl) {
+    stopEl(audioEl);
+    audioEl = null;
+  }
+  const el = new Audio(srcFor(track));
+  el.loop = true;
+  el.volume = 0;
+  el.preload = "auto";
+  audioEl = el;
+  playingTrack = track;
+  void el
+    .play()
+    .then(() => {
+      if (myGen !== gen || desiredTrack !== track || audioEl !== el) return;
+      const steps = 6;
+      let i = 0;
+      clearFade();
+      fadeTimer = setInterval(() => {
+        if (myGen !== gen || audioEl !== el) {
+          clearFade();
+          return;
+        }
+        i += 1;
+        el.volume = Math.min(BGM_VOL, (BGM_VOL * i) / steps);
+        if (i >= steps) clearFade();
+      }, 40);
+    })
+    .catch(() => {
+      // Autoplay blocked — unlockAudio() will retry after a gesture.
+      if (myGen === gen) playingTrack = null;
+    });
+}
+
+function applyDesired() {
+  const track = desiredTrack;
+  if (track == null) return;
+  const myGen = ++gen;
+  if (track === "off") {
+    fadeOutThen(myGen, () => undefined);
+    return;
+  }
+  if (playingTrack === track && audioEl && !audioEl.paused) return;
+  if (!unlocked) {
+    // Keep desired; start after first gesture.
+    fadeOutThen(myGen, () => undefined);
+    return;
+  }
+  fadeOutThen(myGen, () => startTrack(track, myGen));
+}
+
+/** Call from any user gesture so BGM can start under browser autoplay rules. */
+export function unlockAudio() {
+  if (typeof window === "undefined") return;
+  const was = unlocked;
+  unlocked = true;
+  ac();
+  if (!was) {
+    applyDesired();
+    return;
+  }
+  if (audioEl && audioEl.paused && desiredTrack && desiredTrack !== "off" && playingTrack === desiredTrack) {
+    void audioEl.play().catch(() => undefined);
+  } else if (desiredTrack && desiredTrack !== "off" && playingTrack !== desiredTrack) {
+    applyDesired();
+  }
+}
+
+function ensureUnlockHooks() {
+  if (typeof window === "undefined" || hooksInstalled) return;
+  hooksInstalled = true;
+  const onGesture = () => unlockAudio();
+  window.addEventListener("pointerdown", onGesture, { passive: true });
+  window.addEventListener("keydown", onGesture, { passive: true });
+}
+
+/**
+ * Play looping scene BGM from `/game/bgm/*.m4a`.
+ * Same track is a no-op (does not restart). `"off"` fades out and stops.
+ */
+export function playBgm(track: BgmTrack) {
+  ensureUnlockHooks();
+  if (desiredTrack === track) return;
+  desiredTrack = track;
+  applyDesired();
 }

@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { BattleScreen } from "@/components/battle-screen";
 import { PORTRAIT_SRC, SCENE_SRC, UNIT_SRC } from "@/game/art";
-import { playBgm } from "@/game/audio";
+import { playBgm, type BgmTrack } from "@/game/audio";
 import { CLS_NAME, STAGES, UNITS, WEAPONS, weaponById } from "@/game/content";
 import { heartLabel, useGame } from "@/game/store";
 
@@ -25,12 +25,23 @@ export function CaoGame() {
     boot();
   }, [boot]);
 
+  const stageIndex = useGame((s) => s.campaign.stage);
+  const resultWin = useGame((s) => s.result?.win);
+
   useEffect(() => {
-    if (screen === "story") playBgm("story");
-    else if (screen === "battle") playBgm("battle");
-    else if (screen === "title" || screen === "ending") playBgm("title");
-    else playBgm("off");
-  }, [screen]);
+    let track: BgmTrack = "off";
+    if (screen === "title" || screen === "ending") track = "op";
+    else if (screen === "camp" || screen === "help") track = "happy";
+    else if (screen === "story") track = "event";
+    else if (screen === "brief") track = "march";
+    else if (screen === "result") track = resultWin ? "happy" : "tragic";
+    else if (screen === "battle") {
+      if (stageIndex <= 0) track = "battle";
+      else if (stageIndex === 1) track = "battle-tense";
+      else track = "battle-fierce";
+    }
+    playBgm(track);
+  }, [screen, stageIndex, resultWin]);
 
   useEffect(() => {
     if (screen !== "battle" || duel || outcome) return;
